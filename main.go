@@ -19,8 +19,9 @@ const (
 	cdrFile      = "/var/log/asterisk/cdr-csv/Master.csv"
 	configFile   = "/etc/asterisk-monitor/config.conf"
 	historyFile  = "/var/log/asterisk-monitor/call_history.db"
-	checkInterval = 10 * time.Second
-	qualityCheckInterval = 30 * time.Second
+	checkInterval = 30 * time.Second
+	qualityCheckInterval = 60 * time.Second
+	cdrCheckInterval = 300 * time.Second
 )
 
 // ProblemCall представляет проблемный вызов
@@ -63,6 +64,7 @@ type Config struct {
 	PacketLossThreshold float64
 	JitterThreshold    float64
 	ShortCallThreshold int
+	CheckInterval      int
 }
 
 var (
@@ -70,11 +72,13 @@ var (
 	patternsMutex  = &sync.Mutex{}
 	config         Config
 	problemHistory = make(map[string]time.Time)
+	lastAsteriskCheck time.Time
 )
 
 func main() {
 	fmt.Println("Asterisk Problem Calls Monitor запущен...")
 	fmt.Printf("Логи будут записываться в: %s\n", logFile)
+	fmt.Printf("Интервал проверки: %v\n", checkInterval)
 
 	// Загружаем конфигурацию
 	if err := loadConfig(); err != nil {
@@ -86,6 +90,7 @@ func main() {
 			PacketLossThreshold: 5.0,
 			JitterThreshold:    50.0,
 			ShortCallThreshold: 3,
+			CheckInterval:      30,
 		}
 	}
 
@@ -144,6 +149,8 @@ func loadConfig() error {
 			config.JitterThreshold, _ = strconv.ParseFloat(value, 64)
 		case "short_call_threshold":
 			config.ShortCallThreshold, _ = strconv.Atoi(value)
+		case "check_interval":
+			config.CheckInterval, _ = strconv.Atoi(value)
 		}
 	}
 
@@ -151,10 +158,16 @@ func loadConfig() error {
 }
 
 func monitorAsterisk(logFile *os.File) {
+	interval := time.Duration(config.CheckInterval) * time.Second
+	if interval == 0 {
+		interval = checkInterval
+	}
+
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
+		log.Printf("Выполняется проверка Asterisk...")
 		// Получаем статус каналов
 		channels, err := getAsteriskChannels()
 		if err != nil {
@@ -163,9 +176,13 @@ func monitorAsterisk(logFile *os.File) {
 		}
 
 		// Получаем статус SIP пиров
-		sipStatus, err := getSIPStatus()
-		if err != nil {
-			log.Printf("Ошибка получения статуса SIP: %v", err)
+		var sipStatus []string
+		if time.Since(lastAsteriskCheck) > 2*time.Minute {
+			sipStatus, err = getSIPStatus()
+			if err != nil {
+				log.Printf("Ошибка получения статуса SIP: %v", err)
+			}
+			lastAsteriskCheck = time.Now()
 		}
 
 		// Анализируем каналы на проблемы
@@ -210,7 +227,15 @@ func getAsteriskChannels() ([]string, error) {
 	}
 
 	lines := strings.Split(string(output), "\n")
-	return lines, nil
+	var filteredLines []string
+	
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			filteredLines = append(filteredLines, line)
+		}
+	}
+	
+	return filteredLines, nil
 }
 
 func getSIPStatus() ([]string, error) {
@@ -226,15 +251,26 @@ func getSIPStatus() ([]string, error) {
 
 func getRTPQuality() ([]QualityMetrics, error) {
 	var metrics []QualityMetrics
-
-	// Получаем статистику RTP через Asterisk CLI
-	cmd := exec.Command("asterisk", "-rx", "rtp show stats")
+	
+	// Получаем статистику только если есть активные вызовы
+	cmd := exec.Command("asterisk", "-rx", "core show channels")
 	output, err := cmd.Output()
 	if err != nil {
 		return metrics, err
 	}
+	
+	// Если нет активных каналов, возвращаем пустой список
+	if strings.Contains(string(output), "0 active channels") {
+		return metrics, nil
+	}
 
-	// Парсим вывод для активных каналов
+	// Получаем RTP статистику только при наличии активных вызовов
+	cmd = exec.Command("asterisk", "-rx", "rtp show stats")
+	output, err = cmd.Output()
+	if err != nil {
+		return metrics, err
+	}
+
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
 		if strings.Contains(line, "RTP Reader") {
@@ -546,7 +582,7 @@ func analyzeQuality(metrics []QualityMetrics) []ProblemCall {
 }
 
 func analyzeCDR() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(cdrCheckInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
