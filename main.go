@@ -2,9 +2,9 @@ package main
 
 import (
 	"bufio"
-	"encoding/csv"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -15,14 +15,22 @@ import (
 )
 
 const (
-	logFile      = "/var/log/asterisk-monitor/calls_problem_online.log"
-	cdrFile      = "/var/log/asterisk/cdr-csv/Master.csv"
-	configFile   = "/etc/asterisk-monitor/config.conf"
-	historyFile  = "/var/log/asterisk-monitor/call_history.db"
-	checkInterval = 30 * time.Second
-	qualityCheckInterval = 60 * time.Second
-	cdrCheckInterval = 300 * time.Second
+	logFile    = "/var/log/asterisk-monitor/calls_problem_online.log"
+	cdrFile    = "/var/log/asterisk/cdr-csv/Master.csv"
+	configFile = "/etc/asterisk-monitor/config.conf"
+
+	// AMI конфигурация
+	amiHost     = "localhost"
+	amiPort     = "5038"
+	amiUsername = "admin"    // Замените на вашего пользователя AMI
+	amiPassword = "password" // Замените на ваш пароль AMI
 )
+
+// AMIClient для подключения к Asterisk Manager Interface
+type AMIClient struct {
+	conn   net.Conn
+	events chan string
+}
 
 // ProblemCall представляет проблемный вызов
 type ProblemCall struct {
@@ -31,18 +39,28 @@ type ProblemCall struct {
 	CallerID  string
 	Problem   string
 	Details   string
-	Severity  string // "low", "medium", "high", "critical"
+	Severity  string
+}
+
+// ActiveCall отслеживает активные вызовы
+type ActiveCall struct {
+	Channel     string
+	CallerID    string
+	Destination string
+	State       string
+	StartTime   time.Time
+	LastUpdate  time.Time
 }
 
 // QualityMetrics представляет метрики качества связи
 type QualityMetrics struct {
-	Channel      string
-	PacketLoss   float64
-	Jitter       float64
-	Latency      int
-	MOS          float64
-	RTPErrors    int
-	Timestamp    time.Time
+	Channel    string
+	PacketLoss float64
+	Jitter     float64
+	Latency    int
+	MOS        float64
+	RTPErrors  int
+	Timestamp  time.Time
 }
 
 // CallPattern представляет шаблон вызова для детектирования булькания
@@ -58,39 +76,46 @@ type CallPattern struct {
 
 // Config представляет конфигурацию мониторинга
 type Config struct {
-	MaxRingDuration    int
-	MaxCallDuration    int
-	BubblingThreshold  int
+	MaxRingDuration     int
+	MaxCallDuration     int
+	BubblingThreshold   int
 	PacketLossThreshold float64
-	JitterThreshold    float64
-	ShortCallThreshold int
-	CheckInterval      int
+	JitterThreshold     float64
+	ShortCallThreshold  int
+	AMIUsername         string
+	AMIPassword         string
 }
 
 var (
-	callPatterns   = make(map[string]*CallPattern)
-	patternsMutex  = &sync.Mutex{}
-	config         Config
-	problemHistory = make(map[string]time.Time)
-	lastAsteriskCheck time.Time
+	activeCalls       = make(map[string]*ActiveCall)
+	activeMutex       = &sync.Mutex{}
+	callPatterns      = make(map[string]*CallPattern)
+	patternsMutex     = &sync.Mutex{}
+	config            Config
+	monitoring        = false
+	lastAsteriskCheck time.Time // Инициализируем здесь
+	problemHistory    = make(map[string]time.Time)
 )
 
 func main() {
-	fmt.Println("Asterisk Problem Calls Monitor запущен...")
+	fmt.Println("Asterisk Reactive Monitor запущен...")
 	fmt.Printf("Логи будут записываться в: %s\n", logFile)
-	fmt.Printf("Интервал проверки: %v\n", checkInterval)
+
+	// Инициализация переменной
+	lastAsteriskCheck = time.Now()
 
 	// Загружаем конфигурацию
 	if err := loadConfig(); err != nil {
 		log.Printf("Ошибка загрузки конфигурации: %v. Используются значения по умолчанию.", err)
 		config = Config{
-			MaxRingDuration:    30,
-			MaxCallDuration:    3600,
-			BubblingThreshold:  3,
+			MaxRingDuration:     30,
+			MaxCallDuration:     3600,
+			BubblingThreshold:   3,
 			PacketLossThreshold: 5.0,
-			JitterThreshold:    50.0,
-			ShortCallThreshold: 3,
-			CheckInterval:      30,
+			JitterThreshold:     50.0,
+			ShortCallThreshold:  3,
+			AMIUsername:         "admin",
+			AMIPassword:         "password",
 		}
 	}
 
@@ -99,17 +124,17 @@ func main() {
 		log.Fatalf("Ошибка создания директории: %v", err)
 	}
 
-	// Открываем файл логов для записи
-	file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatalf("Ошибка открытия файла логов: %v", err)
-	}
-	defer file.Close()
+	// Запускаем AMI клиент для прослушивания событий
+	go startAMIClient()
 
-	// Запускаем мониторинг Asterisk
-	go monitorAsterisk(file)
-	go monitorQuality()
-	go analyzeCDR()
+	// Запускаем мониторинг активных вызовов
+	go monitorActiveCalls()
+
+	// Запускаем фоновый мониторинг для редких проверок
+	go backgroundMonitoring()
+
+	fmt.Println("✅ Мониторинг запущен в реактивном режиме")
+	fmt.Println("📞 Мониторинг активируется автоматически при звонках")
 
 	// Останавливаемся только при сигнале завершения
 	select {}
@@ -149,307 +174,171 @@ func loadConfig() error {
 			config.JitterThreshold, _ = strconv.ParseFloat(value, 64)
 		case "short_call_threshold":
 			config.ShortCallThreshold, _ = strconv.Atoi(value)
-		case "check_interval":
-			config.CheckInterval, _ = strconv.Atoi(value)
+		case "ami_username":
+			config.AMIUsername = value
+		case "ami_password":
+			config.AMIPassword = value
 		}
 	}
 
 	return nil
 }
 
-func monitorAsterisk(logFile *os.File) {
-	interval := time.Duration(config.CheckInterval) * time.Second
-	if interval == 0 {
-		interval = checkInterval
-	}
+// startAMIClient подключается к AMI и слушает события
+func startAMIClient() {
+	for {
+		log.Println("Подключаемся к Asterisk Manager Interface...")
 
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		log.Printf("Выполняется проверка Asterisk...")
-		// Получаем статус каналов
-		channels, err := getAsteriskChannels()
+		conn, err := net.Dial("tcp", amiHost+":"+amiPort)
 		if err != nil {
-			log.Printf("Ошибка получения статуса каналов: %v", err)
+			log.Printf("Ошибка подключения к AMI: %v. Повтор через 30 секунд...", err)
+			time.Sleep(30 * time.Second)
 			continue
 		}
 
-		// Получаем статус SIP пиров
-		var sipStatus []string
-		if time.Since(lastAsteriskCheck) > 2*time.Minute {
-			sipStatus, err = getSIPStatus()
+		// Аутентификация в AMI
+		authCommand := fmt.Sprintf("Action: Login\r\nUsername: %s\r\nSecret: %s\r\nEvents: on\r\n\r\n",
+			config.AMIUsername, config.AMIPassword)
+		_, err = conn.Write([]byte(authCommand))
+		if err != nil {
+			log.Printf("Ошибка аутентификации в AMI: %v", err)
+			conn.Close()
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		log.Println("✅ Успешно подключено к AMI")
+
+		// Чтение событий
+		reader := bufio.NewReader(conn)
+		buffer := ""
+
+		for {
+			line, err := reader.ReadString('\n')
 			if err != nil {
-				log.Printf("Ошибка получения статуса SIP: %v", err)
+				log.Printf("❌ Ошибка чтения из AMI: %v. Переподключение...", err)
+				conn.Close()
+				break
 			}
-			lastAsteriskCheck = time.Now()
-		}
 
-		// Анализируем каналы на проблемы
-		problemCalls := analyzeChannels(channels, sipStatus)
+			buffer += line
 
-		// Записываем проблемные вызовы в лог
-		if len(problemCalls) > 0 {
-			writeProblemCalls(logFile, problemCalls)
-		}
-	}
-}
-
-func monitorQuality() {
-	ticker := time.NewTicker(qualityCheckInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		// Мониторинг качества RTP
-		qualityMetrics, err := getRTPQuality()
-		if err != nil {
-			log.Printf("Ошибка получения метрик качества: %v", err)
-			continue
-		}
-
-		// Анализ качества связи
-		problemCalls := analyzeQuality(qualityMetrics)
-		if len(problemCalls) > 0 {
-			file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err == nil {
-				writeProblemCalls(file, problemCalls)
-				file.Close()
+			// События разделяются пустой строкой
+			if strings.TrimSpace(line) == "" {
+				go handleAMIEvent(buffer)
+				buffer = ""
 			}
 		}
 	}
 }
 
-func getAsteriskChannels() ([]string, error) {
-	cmd := exec.Command("asterisk", "-rx", "core show channels")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("ошибка выполнения команды asterisk: %v", err)
+// handleAMIEvent обрабатывает события от AMI
+func handleAMIEvent(event string) {
+	// Детектируем начало вызова
+	if strings.Contains(event, "Event: Newchannel") {
+		extractCallInfo(event)
 	}
 
-	lines := strings.Split(string(output), "\n")
-	var filteredLines []string
-	
-	for _, line := range lines {
-		if strings.TrimSpace(line) != "" {
-			filteredLines = append(filteredLines, line)
+	// Детектируем поднятие трубки
+	if strings.Contains(event, "Event: Bridge") && strings.Contains(event, "BridgeState: Link") {
+		startCallMonitoring()
+	}
+
+	// Детектируем состояние звонка
+	if strings.Contains(event, "Event: Newstate") {
+		handleCallState(event)
+	}
+
+	// Детектируем завершение вызова
+	if strings.Contains(event, "Event: Hangup") {
+		handleCallEnd(event)
+	}
+
+	// Логируем важные события для отладки
+	if strings.Contains(event, "Event: Newchannel") ||
+		strings.Contains(event, "Event: Hangup") ||
+		strings.Contains(event, "Event: Bridge") {
+		log.Printf("AMI Event: %s", getEventSummary(event))
+	}
+}
+
+// extractCallInfo извлекает информацию о новом вызове
+func extractCallInfo(event string) {
+	channel := extractValue(event, "Channel: ")
+	callerID := extractValue(event, "CallerIDNum: ")
+
+	if channel != "" {
+		activeMutex.Lock()
+		activeCalls[channel] = &ActiveCall{
+			Channel:    channel,
+			CallerID:   callerID,
+			State:      "Started",
+			StartTime:  time.Now(),
+			LastUpdate: time.Now(),
 		}
+		activeMutex.Unlock()
+
+		log.Printf("📞 Обнаружен новый вызов: %s -> %s", callerID, channel)
 	}
-	
-	return filteredLines, nil
 }
 
-func getSIPStatus() ([]string, error) {
-	cmd := exec.Command("asterisk", "-rx", "sip show peers")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
+// handleCallState обрабатывает изменение состояния вызова
+func handleCallState(event string) {
+	channel := extractValue(event, "Channel: ")
+	state := extractValue(event, "ChannelStateDesc: ")
 
-	lines := strings.Split(string(output), "\n")
-	return lines, nil
-}
+	if channel != "" && state != "" {
+		activeMutex.Lock()
+		if call, exists := activeCalls[channel]; exists {
+			call.State = state
+			call.LastUpdate = time.Now()
 
-func getRTPQuality() ([]QualityMetrics, error) {
-	var metrics []QualityMetrics
-	
-	// Получаем статистику только если есть активные вызовы
-	cmd := exec.Command("asterisk", "-rx", "core show channels")
-	output, err := cmd.Output()
-	if err != nil {
-		return metrics, err
-	}
-	
-	// Если нет активных каналов, возвращаем пустой список
-	if strings.Contains(string(output), "0 active channels") {
-		return metrics, nil
-	}
-
-	// Получаем RTP статистику только при наличии активных вызовов
-	cmd = exec.Command("asterisk", "-rx", "rtp show stats")
-	output, err = cmd.Output()
-	if err != nil {
-		return metrics, err
-	}
-
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "RTP Reader") {
-			metrics = append(metrics, parseRTPLine(line))
-		}
-	}
-
-	return metrics, nil
-}
-
-func parseRTPLine(line string) QualityMetrics {
-	// Пример парсинга строки RTP статистики
-	// Это упрощенный парсер - в реальности нужно адаптировать под ваш формат
-	metric := QualityMetrics{
-		Timestamp: time.Now(),
-	}
-
-	re := regexp.MustCompile(`loss:(\d+\.\d+)%`)
-	if matches := re.FindStringSubmatch(line); len(matches) > 1 {
-		metric.PacketLoss, _ = strconv.ParseFloat(matches[1], 64)
-	}
-
-	re = regexp.MustCompile(`jitter:(\d+\.\d+)`)
-	if matches := re.FindStringSubmatch(line); len(matches) > 1 {
-		metric.Jitter, _ = strconv.ParseFloat(matches[1], 64)
-	}
-
-	// Расчет MOS на основе потерь и джиттера
-	metric.MOS = calculateMOS(metric.PacketLoss, metric.Jitter)
-
-	return metric
-}
-
-func calculateMOS(packetLoss, jitter float64) float64 {
-	// Упрощенный расчет MOS score
-	baseMOS := 4.2
-	lossPenalty := packetLoss * 0.1
-	jitterPenalty := jitter * 0.001
-
-	mos := baseMOS - lossPenalty - jitterPenalty
-	if mos < 1.0 {
-		return 1.0
-	}
-	if mos > 4.5 {
-		return 4.5
-	}
-	return mos
-}
-
-func analyzeChannels(channels, sipStatus []string) []ProblemCall {
-	var problemCalls []ProblemCall
-
-	// Анализ статуса SIP пиров
-	sipProblems := analyzeSIPStatus(sipStatus)
-	problemCalls = append(problemCalls, sipProblems...)
-
-	// Анализ активных каналов
-	for _, line := range channels {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
-		// Проверяем различные типы проблем
-		if problems := detectProblems(line); problems != nil {
-			problemCalls = append(problemCalls, problems...)
-		}
-	}
-
-	return problemCalls
-}
-
-func analyzeSIPStatus(sipStatus []string) []ProblemCall {
-	var problems []ProblemCall
-	currentTime := time.Now().Format("2006-01-02 15:04:05")
-
-	for _, line := range sipStatus {
-		if strings.Contains(line, "UNREACHABLE") || strings.Contains(line, "UNKNOWN") {
-			parts := strings.Fields(line)
-			if len(parts) > 0 {
-				problems = append(problems, ProblemCall{
-					Timestamp: currentTime,
-					Channel:   "SIP Peer",
-					CallerID:  parts[0],
-					Problem:   "SIP пир недоступен",
-					Details:   line,
-					Severity:  "high",
-				})
+			// Запускаем мониторинг при начале звонка
+			if state == "Ringing" || state == "Up" {
+				startCallMonitoring()
 			}
-		}
 
-		if strings.Contains(line, "LAGGED") {
-			parts := strings.Fields(line)
-			if len(parts) > 0 {
-				problems = append(problems, ProblemCall{
-					Timestamp: currentTime,
-					Channel:   "SIP Peer",
-					CallerID:  parts[0],
-					Problem:   "SIP пир с задержками",
-					Details:   line,
+			// Обновляем шаблон вызова для детектирования булькания
+			updateCallPattern(channel, call.CallerID, state)
+		}
+		activeMutex.Unlock()
+	}
+}
+
+// handleCallEnd обрабатывает завершение вызова
+func handleCallEnd(event string) {
+	channel := extractValue(event, "Channel: ")
+	cause := extractValue(event, "Cause: ")
+
+	if channel != "" {
+		activeMutex.Lock()
+		if call, exists := activeCalls[channel]; exists {
+			// Анализируем причину завершения
+			if cause != "0" && cause != "16" { // 0 - нормальное завершение, 16 - ответ
+				problem := ProblemCall{
+					Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+					Channel:   call.Channel,
+					CallerID:  call.CallerID,
+					Problem:   "Аномальное завершение вызова",
+					Details:   fmt.Sprintf("Причина: %s", getCauseDescription(cause)),
 					Severity:  "medium",
-				})
+				}
+				writeProblemCall(problem)
 			}
-		}
-	}
 
-	return problems
+			// Удаляем из активных вызовов
+			delete(activeCalls, channel)
+			log.Printf("📞 Вызов завершен: %s", channel)
+		}
+		activeMutex.Unlock()
+
+		// Проверяем, есть ли еще активные вызовы
+		checkActiveCalls()
+	}
 }
 
-func detectProblems(channelInfo string) []ProblemCall {
-	var problems []ProblemCall
-	currentTime := time.Now().Format("2006-01-02 15:04:05")
-	channel := extractChannel(channelInfo)
-	callerID := extractCallerID(channelInfo)
-
-	// Обновляем шаблон вызова для детектирования булькания
-	updateCallPattern(channel, callerID, channelInfo)
-
-	// Детектор "булькания"
-	if bubbling := detectBubbling(channel, callerID); bubbling != nil {
-		problems = append(problems, *bubbling)
-	}
-
-	// Детектор долгого ожидания ответа
-	if strings.Contains(channelInfo, "RINGING") {
-		if duration := extractDuration(channelInfo); duration > config.MaxRingDuration {
-			problems = append(problems, ProblemCall{
-				Timestamp: currentTime,
-				Channel:   channel,
-				CallerID:  callerID,
-				Problem:   "Долгое ожидание ответа",
-				Details:   fmt.Sprintf("Длительность: %d сек, %s", duration, channelInfo),
-				Severity:  "medium",
-			})
-		}
-	}
-
-	// Детектор заблокированных каналов
-	if strings.Contains(channelInfo, "BUSY") {
-		problems = append(problems, ProblemCall{
-			Timestamp: currentTime,
-			Channel:   channel,
-			CallerID:  callerID,
-			Problem:   "Канал занят",
-			Details:   channelInfo,
-			Severity:  "low",
-		})
-	}
-
-	// Детектор неудачных вызовов
-	if strings.Contains(channelInfo, "FAILED") || strings.Contains(channelInfo, "CONGESTION") {
-		problems = append(problems, ProblemCall{
-			Timestamp: currentTime,
-			Channel:   channel,
-			CallerID:  callerID,
-			Problem:   "Неудачный вызов",
-			Details:   channelInfo,
-			Severity:  "high",
-		})
-	}
-
-	// Детектор долгих вызовов
-	if strings.Contains(channelInfo, "Up") {
-		duration := extractDuration(channelInfo)
-		if duration > config.MaxCallDuration {
-			problems = append(problems, ProblemCall{
-				Timestamp: currentTime,
-				Channel:   channel,
-				CallerID:  callerID,
-				Problem:   "Очень долгий вызов",
-				Details:   fmt.Sprintf("Длительность: %d сек, %s", duration, channelInfo),
-				Severity:  "medium",
-			})
-		}
-	}
-
-	return problems
-}
-
-func updateCallPattern(channel, callerID, channelInfo string) {
+// updateCallPattern обновляет шаблоны вызовов для детектирования булькания
+func updateCallPattern(channel, callerID, state string) {
 	patternsMutex.Lock()
 	defer patternsMutex.Unlock()
 
@@ -473,262 +362,392 @@ func updateCallPattern(channel, callerID, channelInfo string) {
 		pattern.LastReset = time.Now()
 	}
 
-	currentState := extractState(channelInfo)
-	if currentState != pattern.LastState {
+	if state != pattern.LastState {
 		pattern.StateChanges = append(pattern.StateChanges, time.Now())
-		pattern.LastState = currentState
+		pattern.LastState = state
 
 		// Увеличиваем счетчик ringing состояний
-		if currentState == "RINGING" {
+		if state == "Ringing" {
 			pattern.RingCount++
+
+			// Проверяем булькание
+			if pattern.RingCount >= config.BubblingThreshold {
+				problem := ProblemCall{
+					Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+					Channel:   channel,
+					CallerID:  callerID,
+					Problem:   "Обнаружено булькание",
+					Details:   fmt.Sprintf("Количество быстрых звонков: %d", pattern.RingCount),
+					Severity:  "critical",
+				}
+				writeProblemCall(problem)
+
+				// Сбрасываем счетчик после детектирования
+				pattern.RingCount = 0
+			}
 		}
 	}
 }
 
-func detectBubbling(channel, callerID string) *ProblemCall {
-	patternsMutex.Lock()
-	defer patternsMutex.Unlock()
+// startCallMonitoring запускает активный мониторинг
+func startCallMonitoring() {
+	if !monitoring {
+		log.Println("🚀 Запуск активного мониторинга вызовов")
+		monitoring = true
 
-	key := callerID + ":" + channel
-	pattern, exists := callPatterns[key]
-	if !exists {
-		return nil
+		// Запускаем интенсивный мониторинг на время вызова
+		go intensiveMonitoring()
 	}
+}
 
-	currentTime := time.Now().Format("2006-01-02 15:04:05")
+// stopCallMonitoring останавливает активный мониторинг
+func stopCallMonitoring() {
+	if monitoring {
+		log.Println("⏹️ Остановка активного мониторинга")
+		monitoring = false
+	}
+}
 
-	// Детектирование булькания по количеству ringing состояний
-	if pattern.RingCount >= config.BubblingThreshold {
-		// Сбрасываем счетчик после детектирования
-		pattern.RingCount = 0
-		return &ProblemCall{
-			Timestamp: currentTime,
-			Channel:   channel,
-			CallerID:  callerID,
-			Problem:   "Обнаружено булькание",
-			Details:   fmt.Sprintf("Количество быстрых звонков: %d", config.BubblingThreshold),
-			Severity:  "critical",
+// intensiveMonitoring интенсивный мониторинг во время активных вызовов
+func intensiveMonitoring() {
+	ticker := time.NewTicker(5 * time.Second) // Частые проверки во время вызовов
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if !monitoring {
+			return
 		}
-	}
 
-	// Детектирование по частым изменениям состояния
-	if len(pattern.StateChanges) >= 5 {
-		recentChanges := 0
-		for i := len(pattern.StateChanges) - 1; i >= 0; i-- {
-			if time.Since(pattern.StateChanges[i]) <= 2*time.Minute {
-				recentChanges++
+		// Проверяем активные вызовы на проблемы
+		checkActiveCallsForProblems()
+
+		// Проверяем качество RTP
+		checkRTPQuality()
+	}
+}
+
+// checkActiveCalls проверяет наличие активных вызовов
+func checkActiveCalls() {
+	activeMutex.Lock()
+	hasActiveCalls := len(activeCalls) > 0
+	activeMutex.Unlock()
+
+	if !hasActiveCalls && monitoring {
+		// Нет активных вызовов - останавливаем мониторинг через 10 секунд
+		time.AfterFunc(10*time.Second, func() {
+			activeMutex.Lock()
+			stillNoCalls := len(activeCalls) == 0
+			activeMutex.Unlock()
+
+			if stillNoCalls {
+				stopCallMonitoring()
+			}
+		})
+	}
+}
+
+// checkActiveCallsForProblems проверяет активные вызовы на проблемы
+func checkActiveCallsForProblems() {
+	activeMutex.Lock()
+	defer activeMutex.Unlock()
+
+	currentTime := time.Now()
+
+	for channel, call := range activeCalls {
+		// Проверяем долгое ожидание ответа
+		if call.State == "Ringing" {
+			ringDuration := currentTime.Sub(call.StartTime).Seconds()
+			if ringDuration > float64(config.MaxRingDuration) {
+				problem := ProblemCall{
+					Timestamp: currentTime.Format("2006-01-02 15:04:05"),
+					Channel:   channel,
+					CallerID:  call.CallerID,
+					Problem:   "Долгое ожидание ответа",
+					Details:   fmt.Sprintf("Длительность: %.0f сек", ringDuration),
+					Severity:  "medium",
+				}
+				writeProblemCall(problem)
 			}
 		}
 
-		if recentChanges >= 5 {
-			pattern.StateChanges = []time.Time{}
-			return &ProblemCall{
-				Timestamp: currentTime,
-				Channel:   channel,
-				CallerID:  callerID,
-				Problem:   "Частые изменения состояния канала",
-				Details:   "Возможное булькание или нестабильность связи",
+		// Проверяем долгие вызовы
+		if call.State == "Up" {
+			callDuration := currentTime.Sub(call.StartTime).Seconds()
+			if callDuration > float64(config.MaxCallDuration) {
+				problem := ProblemCall{
+					Timestamp: currentTime.Format("2006-01-02 15:04:05"),
+					Channel:   channel,
+					CallerID:  call.CallerID,
+					Problem:   "Очень долгий вызов",
+					Details:   fmt.Sprintf("Длительность: %.0f сек", callDuration),
+					Severity:  "low",
+				}
+				writeProblemCall(problem)
+			}
+		}
+	}
+}
+
+// checkRTPQuality проверяет качество RTP
+func checkRTPQuality() {
+	if !monitoring {
+		return
+	}
+
+	qualityMetrics, err := getRTPQuality()
+	if err != nil {
+		return
+	}
+
+	for _, metric := range qualityMetrics {
+		if metric.PacketLoss > config.PacketLossThreshold {
+			problem := ProblemCall{
+				Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+				Channel:   metric.Channel,
+				CallerID:  "RTP Monitor",
+				Problem:   "Высокие потери пакетов во время вызова",
+				Details:   fmt.Sprintf("Потери: %.2f%%, MOS: %.2f", metric.PacketLoss, metric.MOS),
 				Severity:  "high",
 			}
+			writeProblemCall(problem)
+		}
+	}
+}
+
+// getRTPQuality получает метрики качества RTP
+func getRTPQuality() ([]QualityMetrics, error) {
+	var metrics []QualityMetrics
+
+	// Получаем статистику только если есть активные вызовы
+	cmd := exec.Command("asterisk", "-rx", "core show channels")
+	output, err := cmd.Output()
+	if err != nil {
+		return metrics, err
+	}
+
+	// Если нет активных каналов, возвращаем пустой список
+	if strings.Contains(string(output), "0 active channels") {
+		return metrics, nil
+	}
+
+	// Получаем RTP статистику только при наличии активных вызовов
+	cmd = exec.Command("asterisk", "-rx", "rtp show stats")
+	output, err = cmd.Output()
+	if err != nil {
+		return metrics, err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "RTP Reader") {
+			metrics = append(metrics, parseRTPLine(line))
 		}
 	}
 
-	return nil
+	return metrics, nil
 }
 
-func analyzeQuality(metrics []QualityMetrics) []ProblemCall {
+// parseRTPLine парсит строку RTP статистики
+func parseRTPLine(line string) QualityMetrics {
+	metric := QualityMetrics{
+		Timestamp: time.Now(),
+	}
+
+	re := regexp.MustCompile(`loss:(\d+\.\d+)%`)
+	if matches := re.FindStringSubmatch(line); len(matches) > 1 {
+		metric.PacketLoss, _ = strconv.ParseFloat(matches[1], 64)
+	}
+
+	re = regexp.MustCompile(`jitter:(\d+\.\d+)`)
+	if matches := re.FindStringSubmatch(line); len(matches) > 1 {
+		metric.Jitter, _ = strconv.ParseFloat(matches[1], 64)
+	}
+
+	// Расчет MOS на основе потерь и джиттера
+	metric.MOS = calculateMOS(metric.PacketLoss, metric.Jitter)
+
+	return metric
+}
+
+// calculateMOS рассчитывает MOS score
+func calculateMOS(packetLoss, jitter float64) float64 {
+	baseMOS := 4.2
+	lossPenalty := packetLoss * 0.1
+	jitterPenalty := jitter * 0.001
+
+	mos := baseMOS - lossPenalty - jitterPenalty
+	if mos < 1.0 {
+		return 1.0
+	}
+	if mos > 4.5 {
+		return 4.5
+	}
+	return mos
+}
+
+// backgroundMonitoring фоновый мониторинг для редких проверок
+func backgroundMonitoring() {
+	ticker := time.NewTicker(60 * time.Second) // Проверка раз в минуту
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Проверяем SIP статус раз в 5 минут
+		if time.Since(lastAsteriskCheck) > 5*time.Minute {
+			checkSIPStatus()
+			lastAsteriskCheck = time.Now()
+		}
+
+		// Очистка старых вызовов
+		cleanupOldCalls()
+	}
+}
+
+// checkSIPStatus проверяет статус SIP пиров
+func checkSIPStatus() {
+	sipStatus, err := getSIPStatus()
+	if err != nil {
+		log.Printf("Ошибка получения статуса SIP: %v", err)
+		return
+	}
+
+	problems := analyzeSIPStatus(sipStatus)
+	for _, problem := range problems {
+		writeProblemCall(problem)
+	}
+}
+
+// getSIPStatus получает статус SIP пиров
+func getSIPStatus() ([]string, error) {
+	cmd := exec.Command("asterisk", "-rx", "sip show peers")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(string(output), "\n"), nil
+}
+
+// analyzeSIPStatus анализирует статус SIP пиров
+func analyzeSIPStatus(sipStatus []string) []ProblemCall {
 	var problems []ProblemCall
 	currentTime := time.Now().Format("2006-01-02 15:04:05")
 
-	for _, metric := range metrics {
-		// Проверка потерь пакетов
-		if metric.PacketLoss > config.PacketLossThreshold {
-			problems = append(problems, ProblemCall{
-				Timestamp: currentTime,
-				Channel:   metric.Channel,
-				CallerID:  "RTP Stream",
-				Problem:   "Высокие потери пакетов",
-				Details:   fmt.Sprintf("Потери: %.2f%%, MOS: %.2f", metric.PacketLoss, metric.MOS),
-				Severity:  "high",
-			})
-		}
-
-		// Проверка джиттера
-		if metric.Jitter > config.JitterThreshold {
-			problems = append(problems, ProblemCall{
-				Timestamp: currentTime,
-				Channel:   metric.Channel,
-				CallerID:  "RTP Stream",
-				Problem:   "Высокий джиттер",
-				Details:   fmt.Sprintf("Джиттер: %.2f мс, MOS: %.2f", metric.Jitter, metric.MOS),
-				Severity:  "medium",
-			})
-		}
-
-		// Проверка качества голоса
-		if metric.MOS < 3.0 {
-			problems = append(problems, ProblemCall{
-				Timestamp: currentTime,
-				Channel:   metric.Channel,
-				CallerID:  "RTP Stream",
-				Problem:   "Плохое качество голоса",
-				Details:   fmt.Sprintf("MOS: %.2f (требуется >3.0)", metric.MOS),
-				Severity:  "high",
-			})
+	for _, line := range sipStatus {
+		if strings.Contains(line, "UNREACHABLE") || strings.Contains(line, "UNKNOWN") {
+			parts := strings.Fields(line)
+			if len(parts) > 0 {
+				problems = append(problems, ProblemCall{
+					Timestamp: currentTime,
+					Channel:   "SIP Peer",
+					CallerID:  parts[0],
+					Problem:   "SIP пир недоступен",
+					Details:   line,
+					Severity:  "high",
+				})
+			}
 		}
 	}
 
 	return problems
 }
 
-func analyzeCDR() {
-	ticker := time.NewTicker(cdrCheckInterval)
+// cleanupOldCalls очищает старые записи о вызовах
+func cleanupOldCalls() {
+	patternsMutex.Lock()
+	defer patternsMutex.Unlock()
+
+	currentTime := time.Now()
+	for key, pattern := range callPatterns {
+		if currentTime.Sub(pattern.LastReset) > 24*time.Hour {
+			delete(callPatterns, key)
+		}
+	}
+}
+
+// monitorActiveCalls фоновый мониторинг для очистки старых вызовов
+func monitorActiveCalls() {
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		file, err := os.Open(cdrFile)
-		if err != nil {
-			log.Printf("Ошибка открытия CDR файла: %v", err)
-			continue
-		}
-		defer file.Close()
+		activeMutex.Lock()
+		currentTime := time.Now()
 
-		reader := csv.NewReader(file)
-		records, err := reader.ReadAll()
-		if err != nil {
-			log.Printf("Ошибка чтения CDR: %v", err)
-			continue
-		}
-
-		// Анализ последних записей CDR
-		analyzeShortCalls(records)
-	}
-}
-
-func analyzeShortCalls(records [][]string) {
-	currentTime := time.Now().Format("2006-01-02 15:04:05")
-	shortCallThreshold := time.Duration(config.ShortCallThreshold) * time.Second
-
-	for _, record := range records {
-		if len(record) < 12 {
-			continue
-		}
-
-		// Парсим длительность вызова
-		duration, err := time.ParseDuration(record[9] + "s")
-		if err != nil {
-			continue
-		}
-
-		// Детектирование коротких вызовов
-		if duration <= shortCallThreshold && record[12] == "ANSWERED" {
-			problem := ProblemCall{
-				Timestamp: currentTime,
-				Channel:   record[1],
-				CallerID:  record[2],
-				Problem:   "Очень короткий вызов",
-				Details:   fmt.Sprintf("Длительность: %v, Причина: %s", duration, record[13]),
-				Severity:  "medium",
-			}
-
-			// Записываем в лог
-			file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err == nil {
-				writeProblemCalls(file, []ProblemCall{problem})
-				file.Close()
-			}
-		}
-	}
-}
-
-func extractChannel(line string) string {
-	parts := strings.Fields(line)
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return "unknown"
-}
-
-func extractCallerID(line string) string {
-	re := regexp.MustCompile(`(\+?[0-9]+)`)
-	matches := re.FindStringSubmatch(line)
-	if len(matches) > 0 {
-		return matches[0]
-	}
-
-	if strings.Contains(line, "<") && strings.Contains(line, ">") {
-		start := strings.Index(line, "<")
-		end := strings.Index(line, ">")
-		if start < end {
-			return line[start+1 : end]
-		}
-	}
-	return "unknown"
-}
-
-func extractDuration(line string) int {
-	re := regexp.MustCompile(`(\d+)h\s*(\d+)m\s*(\d+)s`)
-	matches := re.FindStringSubmatch(line)
-	if len(matches) == 4 {
-		hours, _ := strconv.Atoi(matches[1])
-		minutes, _ := strconv.Atoi(matches[2])
-		seconds, _ := strconv.Atoi(matches[3])
-		return hours*3600 + minutes*60 + seconds
-	}
-
-	re = regexp.MustCompile(`(\d+)m\s*(\d+)s`)
-	matches = re.FindStringSubmatch(line)
-	if len(matches) == 3 {
-		minutes, _ := strconv.Atoi(matches[1])
-		seconds, _ := strconv.Atoi(matches[2])
-		return minutes*60 + seconds
-	}
-
-	re = regexp.MustCompile(`(\d+)s`)
-	matches = re.FindStringSubmatch(line)
-	if len(matches) == 2 {
-		seconds, _ := strconv.Atoi(matches[1])
-		return seconds
-	}
-
-	return 0
-}
-
-func extractState(line string) string {
-	states := []string{"RINGING", "UP", "BUSY", "FAILED", "CONGESTION", "ANSWERED"}
-	for _, state := range states {
-		if strings.Contains(line, state) {
-			return state
-		}
-	}
-	return "UNKNOWN"
-}
-
-func writeProblemCalls(logFile *os.File, calls []ProblemCall) {
-	writer := bufio.NewWriter(logFile)
-
-	for _, call := range calls {
-		// Проверяем, не логировали ли мы уже эту проблему недавно
-		problemKey := call.Channel + ":" + call.Problem
-		if lastSeen, exists := problemHistory[problemKey]; exists {
-			if time.Since(lastSeen) < 2*time.Minute {
-				continue // Пропускаем если уже видели эту проблему недавно
+		for channel, call := range activeCalls {
+			// Удаляем вызовы, которые не обновлялись более 5 минут
+			if currentTime.Sub(call.LastUpdate) > 5*time.Minute {
+				delete(activeCalls, channel)
+				log.Printf("Удален зависший вызов: %s", channel)
 			}
 		}
 
-		problemHistory[problemKey] = time.Now()
+		activeMutex.Unlock()
+	}
+}
 
-		logEntry := fmt.Sprintf("[%s] [%s] ПРОБЛЕМА: %s | Канал: %s | CallerID: %s | Детали: %s\n",
-			call.Timestamp, call.Severity, call.Problem, call.Channel, call.CallerID, call.Details)
-
-		_, err := writer.WriteString(logEntry)
-		if err != nil {
-			log.Printf("Ошибка записи в лог: %v", err)
+// Вспомогательные функции
+func extractValue(event, key string) string {
+	if idx := strings.Index(event, key); idx != -1 {
+		start := idx + len(key)
+		end := strings.Index(event[start:], "\r")
+		if end == -1 {
+			end = len(event)
+		} else {
+			end = start + end
 		}
+		return strings.TrimSpace(event[start:end])
+	}
+	return ""
+}
 
-		// Также выводим в консоль для отладки
-		fmt.Print(logEntry)
+func getEventSummary(event string) string {
+	eventType := extractValue(event, "Event: ")
+	channel := extractValue(event, "Channel: ")
+	callerID := extractValue(event, "CallerIDNum: ")
+
+	return fmt.Sprintf("%s - Channel: %s, CallerID: %s", eventType, channel, callerID)
+}
+
+func getCauseDescription(cause string) string {
+	causeMap := map[string]string{
+		"1":  "Не назначенный номер",
+		"3":  "Нет маршрута к назначению",
+		"16": "Нормальное завершение",
+		"17": "Занято",
+		"18": "Таймаут ответа",
+		"19": "Нет ответа",
+		"21": "Вызов отклонен",
+		"34": "Нет канала",
 	}
 
-	writer.Flush()
+	if desc, exists := causeMap[cause]; exists {
+		return desc
+	}
+	return "Неизвестная причина: " + cause
+}
+
+func writeProblemCall(problem ProblemCall) {
+	// Проверяем, не логировали ли мы уже эту проблему недавно
+	problemKey := problem.Channel + ":" + problem.Problem
+	if lastSeen, exists := problemHistory[problemKey]; exists {
+		if time.Since(lastSeen) < 2*time.Minute {
+			return // Пропускаем если уже видели эту проблему недавно
+		}
+	}
+	problemHistory[problemKey] = time.Now()
+
+	file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Ошибка открытия файла логов: %v", err)
+		return
+	}
+	defer file.Close()
+
+	logEntry := fmt.Sprintf("[%s] [%s] ПРОБЛЕМА: %s | Канал: %s | CallerID: %s | Детали: %s\n",
+		problem.Timestamp, problem.Severity, problem.Problem, problem.Channel, problem.CallerID, problem.Details)
+
+	if _, err := file.WriteString(logEntry); err != nil {
+		log.Printf("Ошибка записи в лог: %v", err)
+	}
+
+	fmt.Print(logEntry)
 }
