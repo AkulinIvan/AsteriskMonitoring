@@ -22,14 +22,17 @@ const (
 	// AMI конфигурация
 	amiHost     = "localhost"
 	amiPort     = "5038"
-	amiUsername = "admin"    // Замените на вашего пользователя AMI
-	amiPassword = "password" // Замените на ваш пароль AMI
+	amiUsername = "admin"
+	amiPassword = ",fhf,firf"
 )
 
 // AMIClient для подключения к Asterisk Manager Interface
 type AMIClient struct {
-	conn   net.Conn
-	events chan string
+	conn      net.Conn
+	events    chan string
+	connected bool
+	reconnect chan bool
+	stop      chan bool
 }
 
 // ProblemCall представляет проблемный вызов
@@ -93,16 +96,14 @@ var (
 	patternsMutex     = &sync.Mutex{}
 	config            Config
 	monitoring        = false
-	lastAsteriskCheck time.Time // Инициализируем здесь
+	lastAsteriskCheck = time.Now()
 	problemHistory    = make(map[string]time.Time)
+	amiClient         *AMIClient
 )
 
 func main() {
 	fmt.Println("Asterisk Reactive Monitor запущен...")
 	fmt.Printf("Логи будут записываться в: %s\n", logFile)
-
-	// Инициализация переменной
-	lastAsteriskCheck = time.Now()
 
 	// Загружаем конфигурацию
 	if err := loadConfig(); err != nil {
@@ -124,8 +125,11 @@ func main() {
 		log.Fatalf("Ошибка создания директории: %v", err)
 	}
 
+	// Инициализируем AMI клиент
+	amiClient = NewAMIClient()
+
 	// Запускаем AMI клиент для прослушивания событий
-	go startAMIClient()
+	go amiClient.Start()
 
 	// Запускаем мониторинг активных вызовов
 	go monitorActiveCalls()
@@ -138,6 +142,128 @@ func main() {
 
 	// Останавливаемся только при сигнале завершения
 	select {}
+}
+
+// NewAMIClient создает новый AMI клиент
+func NewAMIClient() *AMIClient {
+	return &AMIClient{
+		events:    make(chan string, 100),
+		reconnect: make(chan bool, 1),
+		stop:      make(chan bool, 1),
+		connected: false,
+	}
+}
+
+// Start запускает AMI клиент
+func (a *AMIClient) Start() {
+	for {
+		select {
+		case <-a.stop:
+			return
+		default:
+			if err := a.connect(); err != nil {
+				log.Printf("❌ Ошибка подключения к AMI: %v. Повтор через 10 секунд...", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+
+			// Успешное подключение
+			a.connected = true
+			log.Println("✅ Успешно подключено к AMI")
+
+			// Запускаем чтение событий
+			if err := a.readEvents(); err != nil {
+				log.Printf("❌ Ошибка чтения событий AMI: %v", err)
+				a.connected = false
+				a.conn.Close()
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}
+}
+
+// connect устанавливает соединение с AMI
+func (a *AMIClient) connect() error {
+	log.Println("Подключаемся к Asterisk Manager Interface...")
+
+	conn, err := net.Dial("tcp", amiHost+":"+amiPort)
+	if err != nil {
+		return fmt.Errorf("ошибка подключения: %v", err)
+	}
+
+	// Устанавливаем таймауты
+	conn.SetReadDeadline(time.Time{}) // Без таймаута
+
+	// Аутентификация в AMI
+	authCommand := fmt.Sprintf("Action: Login\r\nUsername: %s\r\nSecret: %s\r\nEvents: on\r\n\r\n",
+		config.AMIUsername, config.AMIPassword)
+
+	if _, err := conn.Write([]byte(authCommand)); err != nil {
+		conn.Close()
+		return fmt.Errorf("ошибка аутентификации: %v", err)
+	}
+
+	// Читаем ответ
+	reader := bufio.NewReader(conn)
+	response := ""
+	for i := 0; i < 10; i++ { // Читаем несколько строк ответа
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			return fmt.Errorf("ошибка чтения ответа: %v", err)
+		}
+		response += line
+
+		if strings.Contains(line, "Message: Authentication accepted") {
+			a.conn = conn
+			return nil
+		}
+
+		if strings.Contains(line, "Message: Authentication failed") {
+			conn.Close()
+			return fmt.Errorf("аутентификация не удалась")
+		}
+	}
+
+	conn.Close()
+	return fmt.Errorf("таймаут аутентификации")
+}
+
+// readEvents читает события из AMI
+func (a *AMIClient) readEvents() error {
+	reader := bufio.NewReader(a.conn)
+	buffer := ""
+
+	for {
+		// Устанавливаем таймаут чтения
+		a.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("ошибка чтения: %v", err)
+		}
+
+		buffer += line
+
+		// События разделяются пустой строкой
+		if strings.TrimSpace(line) == "" && strings.TrimSpace(buffer) != "" {
+			// Отправляем событие в канал
+			select {
+			case a.events <- buffer:
+				// Событие отправлено
+			default:
+				log.Printf("⚠️  Переполнение буфера событий AMI")
+			}
+			buffer = ""
+		}
+	}
+}
+
+// processEvents обрабатывает события AMI
+func (a *AMIClient) processEvents() {
+	for event := range a.events {
+		go handleAMIEvent(event)
+	}
 }
 
 func loadConfig() error {
@@ -184,56 +310,15 @@ func loadConfig() error {
 	return nil
 }
 
-// startAMIClient подключается к AMI и слушает события
-func startAMIClient() {
-	for {
-		log.Println("Подключаемся к Asterisk Manager Interface...")
-
-		conn, err := net.Dial("tcp", amiHost+":"+amiPort)
-		if err != nil {
-			log.Printf("Ошибка подключения к AMI: %v. Повтор через 30 секунд...", err)
-			time.Sleep(30 * time.Second)
-			continue
-		}
-
-		// Аутентификация в AMI
-		authCommand := fmt.Sprintf("Action: Login\r\nUsername: %s\r\nSecret: %s\r\nEvents: on\r\n\r\n",
-			config.AMIUsername, config.AMIPassword)
-		_, err = conn.Write([]byte(authCommand))
-		if err != nil {
-			log.Printf("Ошибка аутентификации в AMI: %v", err)
-			conn.Close()
-			time.Sleep(30 * time.Second)
-			continue
-		}
-
-		log.Println("✅ Успешно подключено к AMI")
-
-		// Чтение событий
-		reader := bufio.NewReader(conn)
-		buffer := ""
-
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				log.Printf("❌ Ошибка чтения из AMI: %v. Переподключение...", err)
-				conn.Close()
-				break
-			}
-
-			buffer += line
-
-			// События разделяются пустой строкой
-			if strings.TrimSpace(line) == "" {
-				go handleAMIEvent(buffer)
-				buffer = ""
-			}
-		}
-	}
-}
-
 // handleAMIEvent обрабатывает события от AMI
 func handleAMIEvent(event string) {
+	// Логируем событие для отладки (можно убрать в продакшене)
+	if strings.Contains(event, "Event: Newchannel") ||
+		strings.Contains(event, "Event: Hangup") ||
+		strings.Contains(event, "Event: Bridge") {
+		log.Printf("📞 AMI Event: %s", getEventSummary(event))
+	}
+
 	// Детектируем начало вызова
 	if strings.Contains(event, "Event: Newchannel") {
 		extractCallInfo(event)
@@ -252,13 +337,6 @@ func handleAMIEvent(event string) {
 	// Детектируем завершение вызова
 	if strings.Contains(event, "Event: Hangup") {
 		handleCallEnd(event)
-	}
-
-	// Логируем важные события для отладки
-	if strings.Contains(event, "Event: Newchannel") ||
-		strings.Contains(event, "Event: Hangup") ||
-		strings.Contains(event, "Event: Bridge") {
-		log.Printf("AMI Event: %s", getEventSummary(event))
 	}
 }
 
@@ -587,6 +665,9 @@ func calculateMOS(packetLoss, jitter float64) float64 {
 
 // backgroundMonitoring фоновый мониторинг для редких проверок
 func backgroundMonitoring() {
+	// Запускаем обработку событий AMI
+	go amiClient.processEvents()
+
 	ticker := time.NewTicker(60 * time.Second) // Проверка раз в минуту
 	defer ticker.Stop()
 
