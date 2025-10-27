@@ -657,8 +657,10 @@ func loadLegacyConfig(data []byte) error {
 			config.JitterThreshold, _ = strconv.ParseFloat(value, 64)
 		case "short_call_threshold":
 			config.ShortCallThreshold, _ = strconv.Atoi(value)
-		case "check_interval":
-			config.CheckInterval, _ = strconv.Atoi(value)
+		case "ami_username":
+			config.AMIUsername = value
+		case "ami_password":
+			config.AMIPassword = value
 		}
 	}
 
@@ -902,12 +904,19 @@ func monitorCallQuality() {
 			log.Printf("❌ Ошибка получения метрик качества: %v", err)
 			continue
 		}
+		activeMutex.Unlock()
 
 		problems := analyzeQuality(metrics)
 		if len(problems) > 0 {
 			logProblemsIntelligently(problems)
 			updateStats(len(problems))
 		}
+		activeMutex.Unlock()
+
+		// Проверяем, есть ли еще активные вызовы
+		checkActiveCalls()
+	}
+}
 
 		// Обновляем метрики качества в реальном времени
 		updateQualityMetrics(metrics)
@@ -983,6 +992,52 @@ func analyzeCallPatternsFromCDR(records [][]string) {
 		case "NO ANSWER", "BUSY", "FAILED":
 			failedCalls++
 		}
+		callPatterns[key] = pattern
+	}
+
+	// Сбрасываем счетчик если прошло больше часа
+	if time.Since(pattern.LastReset) > time.Hour {
+		pattern.RingCount = 0
+		pattern.ShortCalls = 0
+		pattern.StateChanges = []time.Time{}
+		pattern.LastReset = time.Now()
+	}
+
+	if state != pattern.LastState {
+		pattern.StateChanges = append(pattern.StateChanges, time.Now())
+		pattern.LastState = state
+
+		// Увеличиваем счетчик ringing состояний
+		if state == "Ringing" {
+			pattern.RingCount++
+
+			// Проверяем булькание
+			if pattern.RingCount >= config.BubblingThreshold {
+				problem := ProblemCall{
+					Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+					Channel:   channel,
+					CallerID:  callerID,
+					Problem:   "Обнаружено булькание",
+					Details:   fmt.Sprintf("Количество быстрых звонков: %d", pattern.RingCount),
+					Severity:  "critical",
+				}
+				writeProblemCall(problem)
+
+				// Сбрасываем счетчик после детектирования
+				pattern.RingCount = 0
+			}
+		}
+	}
+}
+
+// startCallMonitoring запускает активный мониторинг
+func startCallMonitoring() {
+	if !monitoring {
+		log.Println("🚀 Запуск активного мониторинга вызовов")
+		monitoring = true
+
+		// Запускаем интенсивный мониторинг на время вызова
+		go intensiveMonitoring()
 	}
 
 	// Логируем статистику
@@ -1185,6 +1240,7 @@ func cleanupOldData() {
 			delete(callPatterns, key)
 		}
 	}
+}
 
 	// Очистка истории проблем
 	for key, lastSeen := range problemHistory {
@@ -1651,9 +1707,9 @@ func analyzeQuality(metrics []QualityMetrics) []ProblemCall {
 				MOS:       metric.MOS,
 			})
 		}
+		return strings.TrimSpace(event[start:end])
 	}
-
-	return problems
+	return ""
 }
 
 func detectAnomalies(records [][]string) {
